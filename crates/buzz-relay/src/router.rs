@@ -4,8 +4,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{ConnectInfo, FromRequest, State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware,
     response::{IntoResponse, Json},
     routing::{get, post, put},
@@ -16,7 +17,7 @@ use tower::ServiceExt;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::services::ServeDir;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{HttpMakeClassifier, TraceLayer};
 
 use crate::api;
 use crate::audio;
@@ -185,10 +186,58 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         merged = merged.fallback_service(spa_fallback);
     }
 
-    merged
+    // Optional path prefix (`BUZZ_BASE_PATH`). Empty is the default and leaves
+    // the router exactly as built above. When set, the whole surface nests
+    // under the prefix so the relay can live behind a gateway that routes by
+    // path rather than by hostname.
+    //
+    // `nest` strips the prefix before the inner router sees the request, so
+    // every route match, the SPA fallback's `req.uri().path()` checks, and the
+    // media/git sub-routers keep working against their unprefixed paths.
+    //
+    // Health probes stay mounted at the root as well: Kubernetes probes reach
+    // the pod directly rather than through the gateway that needs the prefix,
+    // and `deploy/compose` curls `/_liveness` on the published port.
+    let root_health = Router::new()
+        .route("/health", get(health_handler))
+        .route("/_liveness", get(liveness_handler))
+        .route("/_readiness", get(readiness_handler))
+        .with_state(state.clone());
+    let routed = nest_under_base_path(&state.config.base_path, merged, root_health);
+
+    routed
         .layer(middleware::from_fn(track_metrics))
-        .layer(TraceLayer::new_for_http())
+        .layer(http_trace_layer())
         .layer(build_cors_layer(&state.config.cors_origins))
+}
+
+/// Mount `router` under `base_path`, keeping `root_extras` reachable at the root.
+///
+/// An empty `base_path` returns `router` untouched — the default, and byte-identical
+/// to the pre-`BUZZ_BASE_PATH` router. Otherwise everything nests under the prefix
+/// so the relay can sit behind a gateway that routes by path rather than hostname.
+/// `nest` strips the prefix before the inner router sees the request, so route
+/// matches and the SPA fallback's own `req.uri().path()` checks keep working
+/// against their unprefixed paths.
+fn nest_under_base_path(base_path: &str, router: Router, root_extras: Router) -> Router {
+    if base_path.is_empty() {
+        router
+    } else {
+        Router::new().nest(base_path, router).merge(root_extras)
+    }
+}
+
+fn http_trace_layer() -> TraceLayer<HttpMakeClassifier, fn(&Request<Body>) -> tracing::Span> {
+    TraceLayer::new_for_http().make_span_with(make_http_span as fn(&Request<Body>) -> tracing::Span)
+}
+
+fn make_http_span(request: &Request<Body>) -> tracing::Span {
+    tracing::info_span!(
+        target: "buzz_relay",
+        "http.request",
+        otel.kind = "server",
+        http.request.method = %request.method(),
+    )
 }
 
 fn is_admin_spa_path(path: &str) -> bool {
@@ -435,9 +484,14 @@ fn build_cors_layer(cors_origins: &[String]) -> CorsLayer {
 mod tests {
     use axum::{routing::get, Router};
     use futures_util::SinkExt;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use tower::ServiceBuilder;
+    use tracing::Instrument as _;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
 
@@ -469,6 +523,133 @@ mod tests {
         assert!(should_serve_spa("/", true));
         assert!(should_serve_spa("/repos/example", true));
         assert!(!should_serve_spa("/arbitrary", true));
+    }
+
+    /// Build the two-router pair `build_router` hands to [`nest_under_base_path`],
+    /// standing in for the real relay surface and the root-mounted health probes.
+    fn base_path_fixture(base_path: &str) -> Router {
+        // The real surface already carries the health probes (they live in
+        // `api_router`), so `root_extras` is a deliberate duplicate that only
+        // matters once the surface moves under a prefix.
+        let surface = Router::new()
+            .route("/", get(|| async { "ws-or-nip11" }))
+            .route("/events", get(|| async { "events" }))
+            .route("/_liveness", get(|| async { "ok" }));
+        let root_extras = Router::new().route("/_liveness", get(|| async { "ok" }));
+        nest_under_base_path(base_path, surface, root_extras)
+    }
+
+    async fn status_of(router: Router, path: &str) -> StatusCode {
+        let request = Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        router
+            .oneshot(request)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_base_path_leaves_every_route_at_the_root() {
+        let router = base_path_fixture("");
+        assert_eq!(status_of(router.clone(), "/").await, StatusCode::OK);
+        assert_eq!(status_of(router.clone(), "/events").await, StatusCode::OK);
+        assert_eq!(status_of(router, "/_liveness").await, StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_path_moves_the_surface_under_the_prefix() {
+        let router = base_path_fixture("/relay");
+        // The WebSocket/NIP-11 route answers on the bare prefix, which is what a
+        // client connecting to wss://host/relay asks for.
+        assert_eq!(status_of(router.clone(), "/relay").await, StatusCode::OK);
+        assert_eq!(
+            status_of(router.clone(), "/relay/events").await,
+            StatusCode::OK
+        );
+        // Root probes stay reachable: Kubernetes hits the pod directly, bypassing
+        // the gateway that requires the prefix.
+        assert_eq!(
+            status_of(router.clone(), "/_liveness").await,
+            StatusCode::OK
+        );
+        // Unprefixed application paths no longer resolve — the gateway owns the
+        // root, and a stale client hitting it should fail loudly, not silently
+        // reach a half-configured relay.
+        assert_eq!(
+            status_of(router.clone(), "/events").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(status_of(router, "/other").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_segment_base_path_routes() {
+        let router = base_path_fixture("/buzz/relay");
+        assert_eq!(
+            status_of(router.clone(), "/buzz/relay").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            status_of(router, "/buzz/relay/events").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_and_datastore_spans_are_exported_in_the_same_trace() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("test"))
+                .with_filter(crate::telemetry::otel_env_filter(None)),
+        );
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let service = ServiceBuilder::new()
+            .layer(http_trace_layer())
+            .service(tower::service_fn(
+                |_: axum::http::Request<axum::body::Body>| async {
+                    async {}
+                        .instrument(tracing::info_span!(
+                            target: "buzz_datastore",
+                            "SELECT",
+                            otel.kind = "client",
+                            db.system.name = "postgresql",
+                        ))
+                        .await;
+                    Ok::<_, std::convert::Infallible>(axum::response::Response::new(
+                        axum::body::Body::empty(),
+                    ))
+                },
+            ));
+
+        service
+            .oneshot(
+                axum::http::Request::get("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let http = spans
+            .iter()
+            .find(|span| span.name == "http.request")
+            .unwrap();
+        let datastore = spans.iter().find(|span| span.name == "SELECT").unwrap();
+
+        assert_eq!(
+            datastore.span_context.trace_id(),
+            http.span_context.trace_id()
+        );
+        assert_eq!(datastore.parent_span_id, http.span_context.span_id());
     }
 
     async fn handler_receives_message_with_limit(limit: usize, size: usize) -> bool {

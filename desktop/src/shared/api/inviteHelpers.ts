@@ -1,4 +1,5 @@
 export const INVITE_EXPIRED_ERROR = "invite_expired";
+export const INVITE_EXHAUSTED_ERROR = "invite_exhausted";
 
 /**
  * Parsed invite — either a full (relay + code) or bare-code form.
@@ -17,6 +18,7 @@ export type ParsedInvite =
  * Accepted input forms:
  *  - `https://<relay>/invite/<code>` → `{ relayWsUrl: "wss://<relay>", code }`
  *  - `http://<relay>/invite/<code>`  → `{ relayWsUrl: "ws://<relay>", code }`
+ *  - `https://<relay>/<base>/invite/<code>` → `{ relayWsUrl: "wss://<relay>/<base>", code }`
  *  - `buzz://join?relay=<wsUrl>&code=<code>` → `{ relayWsUrl, code }`
  *  - bare code (no `://`, no `/`)    → `{ code }`
  *
@@ -51,16 +53,21 @@ export function parseInviteInput(input: string): ParsedInvite | null {
       return { relayWsUrl: relay, code };
     }
 
-    // https(s)://<relay>/invite/<code>
+    // https(s)://<relay>[/<base-path>]/invite/<code>
     if (url.protocol === "https:" || url.protocol === "http:") {
       if (url.username || url.password || url.hash) return null;
-      // pathname must be /invite/<code> with optional single trailing slash
-      const match = url.pathname.match(/^\/invite\/([^/]+)\/?$/);
-      if (!match?.[1]) return null;
-      const code = decodeURIComponent(match[1]);
+      // `/invite/<code>` may be preceded by a base path when the relay is served
+      // under one (BUZZ_BASE_PATH), e.g. https://host/relay/invite/<code>. The
+      // prefix is captured so it can be carried into the derived relay URL —
+      // rebuilding from `url.host` alone would drop it and the client would then
+      // dial a relay that isn't there.
+      const match = url.pathname.match(/^(\/.*?)?\/invite\/([^/]+)\/?$/);
+      if (!match?.[2]) return null;
+      const basePath = match[1] ?? "";
+      const code = decodeURIComponent(match[2]);
       // Convert scheme: https → wss, http → ws. url.host already includes port.
-      const relayWsUrl =
-        url.protocol === "https:" ? `wss://${url.host}` : `ws://${url.host}`;
+      const scheme = url.protocol === "https:" ? "wss" : "ws";
+      const relayWsUrl = `${scheme}://${url.host}${basePath}`;
       return { relayWsUrl, code };
     }
 
@@ -88,4 +95,8 @@ export function inviteErrorMessage(error: unknown): string {
 
 export function isInviteExpiredError(error: unknown): boolean {
   return inviteErrorMessage(error) === INVITE_EXPIRED_ERROR;
+}
+
+export function isInviteExhaustedError(error: unknown): boolean {
+  return inviteErrorMessage(error) === INVITE_EXHAUSTED_ERROR;
 }
